@@ -14,6 +14,7 @@
  */
 
 import type { Plugin, PluginInput, Hooks } from '@opencode-ai/plugin';
+import { context as otelContext, ROOT_CONTEXT } from '@opentelemetry/api';
 import {
   init,
   startSpan,
@@ -483,38 +484,45 @@ async function processSession(sessionId: string, messages: Message[]): Promise<v
   // span. This lets us attach trace-level metadata through the public
   // `updateCurrentTrace` API (which targets the active trace) instead of
   // reaching into `InMemoryTraceManager` internals.
-  const traceId = await withSpan(
-    (parentSpan) => {
-      // Create child spans for LLM calls and tools
-      createLlmAndToolSpans(parentSpan, messages, lastUserIdx + 1);
+  // OpenCode invokes plugin hooks while its AI SDK instrumentation can still have
+  // an active OpenTelemetry span (for example ai.streamText/ai.toolCall). Detach
+  // from that context so each OpenCode turn becomes its own MLflow root trace.
+  // Otherwise the MLflow AGENT/LLM/TOOL spans are nested under unrelated UNKNOWN
+  // spans, which prevents span-level dashboard aggregation such as Tool Calls.
+  const traceId = await otelContext.with(ROOT_CONTEXT, () =>
+    withSpan(
+      (parentSpan) => {
+        // Create child spans for LLM calls and tools
+        createLlmAndToolSpans(parentSpan, messages, lastUserIdx + 1);
 
-      // Attach session/user and request/response previews to the trace.
-      updateCurrentTrace({
-        metadata: {
-          [TRACE_SESSION_METADATA_KEY]: sessionId,
-          [TRACE_USER_METADATA_KEY]: process.env.USER || '',
-        },
-        requestPreview: userPrompt.slice(0, MAX_PREVIEW_LENGTH),
-        ...(finalResponse ? { responsePreview: finalResponse.slice(0, MAX_PREVIEW_LENGTH) } : {}),
-      });
+        // Attach session/user and request/response previews to the trace.
+        updateCurrentTrace({
+          metadata: {
+            [TRACE_SESSION_METADATA_KEY]: sessionId,
+            [TRACE_USER_METADATA_KEY]: process.env.USER || '',
+          },
+          requestPreview: userPrompt.slice(0, MAX_PREVIEW_LENGTH),
+          ...(finalResponse ? { responsePreview: finalResponse.slice(0, MAX_PREVIEW_LENGTH) } : {}),
+        });
 
-      // End the parent span with the reconstructed end time. withSpan issues a
-      // trailing end() at the current time, but OpenTelemetry ignores end() on
-      // an already-ended span, so this explicit end time is what is recorded.
-      parentSpan.setOutputs({
-        response: finalResponse || 'Conversation completed',
-        status: 'completed',
-      });
-      parentSpan.end({ endTimeNs: updatedNs });
+        // End the parent span with the reconstructed end time. withSpan issues a
+        // trailing end() at the current time, but OpenTelemetry ignores end() on
+        // an already-ended span, so this explicit end time is what is recorded.
+        parentSpan.setOutputs({
+          response: finalResponse || 'Conversation completed',
+          status: 'completed',
+        });
+        parentSpan.end({ endTimeNs: updatedNs });
 
-      return parentSpan.traceId;
-    },
-    {
-      name: 'opencode_conversation',
-      inputs: { prompt: userPrompt },
-      startTimeNs: createdNs,
-      spanType: SpanType.AGENT,
-    },
+        return parentSpan.traceId;
+      },
+      {
+        name: 'opencode_conversation',
+        inputs: { prompt: userPrompt },
+        startTimeNs: createdNs,
+        spanType: SpanType.AGENT,
+      },
+    ),
   );
 
   // Flush traces to MLflow
