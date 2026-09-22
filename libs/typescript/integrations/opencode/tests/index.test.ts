@@ -14,6 +14,15 @@ interface PluginClient {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type EventParams = any;
 
+// Mock OpenTelemetry context so we can verify plugin-generated traces are
+// detached from OpenCode's active AI SDK span hierarchy.
+jest.mock('@opentelemetry/api', () => ({
+  context: {
+    with: jest.fn((_ctx: unknown, callback: () => unknown) => callback()),
+  },
+  ROOT_CONTEXT: { root: true },
+}));
+
 // Mock the @mlflow/core module
 jest.mock('@mlflow/core', () => {
   const mockSpan = {
@@ -1017,6 +1026,44 @@ describe('MLflowTracingPlugin', () => {
       // Should have more spans now
       expect((mlflowTracing.startSpan as jest.Mock).mock.calls.length).toBeGreaterThan(
         firstCallCount,
+      );
+    });
+  });
+
+  describe('Root Trace Isolation', () => {
+    beforeEach(() => {
+      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
+    });
+
+    it('should detach MLflow traces from any active OpenTelemetry context', async () => {
+      const messages = [
+        createUserMessage('Run a tool'),
+        createToolCallMessage('read', {
+          input: { path: '/tmp/test' },
+          output: 'content',
+        }),
+      ];
+
+      const mockClient = createMockClient({}, messages);
+      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
+
+      await hooks.event!(createSessionIdleEvent('root-trace-session'));
+
+      const otel = jest.requireMock('@opentelemetry/api') as {
+        context: { with: jest.Mock };
+        ROOT_CONTEXT: unknown;
+      };
+      expect(otel.context.with).toHaveBeenCalledWith(
+        otel.ROOT_CONTEXT,
+        expect.any(Function),
+      );
+      expect(mlflowTracing.withSpan).toHaveBeenCalledWith(
+        expect.any(Function),
+        expect.objectContaining({
+          name: 'opencode_conversation',
+          spanType: 'AGENT',
+        }),
       );
     });
   });
