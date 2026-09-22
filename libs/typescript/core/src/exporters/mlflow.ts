@@ -7,6 +7,7 @@ import {
   SpanExporter,
 } from '@opentelemetry/sdk-trace-base';
 import { Context } from '@opentelemetry/api';
+import { ProtobufTraceSerializer } from '@opentelemetry/otlp-transformer';
 import { createAndRegisterMlflowSpan } from '../core/api';
 import { getConfiguredTraceMetadata, getConfiguredTraceTags } from '../core/context';
 import { InMemoryTraceManager } from '../core/trace_manager';
@@ -32,6 +33,64 @@ import { resolveEnvironmentMetadata } from '../core/utils/environment';
 function generateTraceId(span: OTelSpan): string {
   // NB: trace Id is already hex string in Typescript OpenTelemetry SDK
   return TRACE_ID_PREFIX + span.spanContext().traceId;
+}
+
+function decodeMlflowSpanAttributes(
+  attributes: OTelReadableSpan['attributes'],
+): Record<string, unknown> {
+  const decoded: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(attributes)) {
+    if (typeof value === 'string' && value.startsWith('"')) {
+      try {
+        decoded[key] = JSON.parse(value);
+      } catch {
+        decoded[key] = value;
+      }
+    } else {
+      decoded[key] = value;
+    }
+  }
+  return decoded;
+}
+
+function spanWithDecodedAttributes(span: OTelReadableSpan): OTelReadableSpan {
+  const decoded = decodeMlflowSpanAttributes(span.attributes);
+  return new Proxy(span, {
+    get(target, prop) {
+      if (prop === 'attributes') {
+        return decoded;
+      }
+      const value: unknown = Reflect.get(target, prop);
+      return typeof value === 'function' ? (value.bind(target) as unknown) : value;
+    },
+  });
+}
+
+/**
+ * Serialize all spans in a completed trace to OTLP protobuf so the OSS
+ * tracking server persists them in SqlSpan. DB-backed trace metrics such as
+ * Tool Calls and span latency are computed from SqlSpan rather than the JSON
+ * trace artifact.
+ */
+function serializeSpansToOtlp(spans: OTelReadableSpan[]): Uint8Array | undefined {
+  const serializable = spans.filter((s) => s?.resource != null && s?.instrumentationScope != null);
+  if (serializable.length === 0) {
+    return undefined;
+  }
+
+  try {
+    const bytes = ProtobufTraceSerializer.serializeRequest(
+      serializable.map(spanWithDecodedAttributes),
+    );
+    return bytes && bytes.length > 0 ? bytes : undefined;
+  } catch (err) {
+    console.warn(
+      '[mlflow] Failed to serialize spans to OTLP protobuf; spans will remain available ' +
+        'in the JSON trace artifact but will not appear in DB-backed span metrics.',
+      err,
+    );
+    return undefined;
+  }
 }
 
 export class MlflowSpanProcessor implements SpanProcessor {
@@ -219,6 +278,27 @@ export class MlflowSpanExporter implements SpanExporter {
       const traceInfo = await this._client.createTrace(trace.info);
       // Step 2: Upload trace data (spans) to artifact storage
       await this._client.uploadTraceData(traceInfo, trace.data);
+
+      // Step 3: Also ingest spans through the OSS OTLP endpoint so they are
+      // persisted in SqlSpan. The JSON artifact powers trace detail retrieval,
+      // while DB-backed metrics (for example Tool Calls in the Overview UI)
+      // query the SqlSpan table.
+      const otlpBytes = serializeSpansToOtlp(
+        trace.data.spans.map((span) => span._span as OTelReadableSpan),
+      );
+      if (otlpBytes) {
+        try {
+          await this._client.exportOtlpSpans(getConfig().experimentId, otlpBytes);
+        } catch (error) {
+          // Preserve the existing trace-export behavior if metrics ingestion
+          // fails: the trace is still available through its JSON artifact.
+          console.warn(
+            `Failed to ingest OTLP spans for trace ${trace.info.traceId}; ` +
+              'DB-backed span metrics will be unavailable:',
+            error,
+          );
+        }
+      }
     } catch (error) {
       console.error(`Failed to export trace ${trace.info.traceId}:`, error);
       throw error;
