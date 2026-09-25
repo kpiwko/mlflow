@@ -41,6 +41,18 @@ const PART_TYPE_TEXT = 'text';
 const PART_TYPE_TOOL = 'tool';
 const PART_TYPE_REASONING = 'reasoning';
 
+// OpenCode provider IDs do not always match the provider identifiers used by
+// MLflow's pricing catalog / LiteLLM. Normalize only the known mismatches and
+// preserve all other provider IDs verbatim.
+const MLFLOW_PROVIDER_ALIASES: Record<string, string> = {
+  'google-vertex': 'vertex_ai',
+  'google-vertex-anthropic': 'vertex_ai',
+};
+
+function normalizeProviderId(providerId: string): string {
+  return MLFLOW_PROVIDER_ALIASES[providerId] ?? providerId;
+}
+
 // Well-known trace metadata keys. We pass these through updateCurrentTrace's
 // generic `metadata` option rather than its `sessionId`/`user` convenience
 // options, since those options (and the TraceMetadataKey.TRACE_SESSION/TRACE_USER
@@ -292,10 +304,10 @@ function buildTokenUsage(tokens: MessageInfo['tokens']): Record<string, number> 
   const cache = tokens.cache;
   if (cache) {
     if (cache.read) {
-      usage.cache_read_tokens = cache.read;
+      usage.cache_read_input_tokens = cache.read;
     }
     if (cache.write) {
-      usage.cache_write_tokens = cache.write;
+      usage.cache_creation_input_tokens = cache.write;
     }
   }
 
@@ -319,6 +331,7 @@ function createLlmAndToolSpans(
     const parts = msg.parts || [];
     const modelId = msg.info?.modelID || 'unknown';
     const providerId = msg.info?.providerID || 'unknown';
+    const mlflowProviderId = normalizeProviderId(providerId);
     const tokens = msg.info?.tokens;
 
     // Get timing from message
@@ -351,8 +364,8 @@ function createLlmAndToolSpans(
           messages: conversationMessages,
         },
         attributes: {
-          model: modelId,
-          provider: providerId,
+          [SpanAttributeKey.MODEL]: modelId,
+          [SpanAttributeKey.MODEL_PROVIDER]: mlflowProviderId,
         },
       });
 

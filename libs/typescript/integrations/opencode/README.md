@@ -34,6 +34,12 @@ export MLFLOW_EXPERIMENT_ID=123
 
 3. Run OpenCode normally - traces are created automatically when sessions become idle.
 
+> **OpenCode native OpenTelemetry:** do not enable `experimental.openTelemetry` alongside
+> `@mlflow/opencode` unless you intentionally want both telemetry streams. The plugin creates
+> its own LLM/tool spans; enabling OpenCode's native AI SDK telemetry as well can produce duplicate
+> LLM spans and double-count token/cost metrics (for example both `gpt-5.6-terra` and
+> `openai/gpt-5.6-terra`).
+
 ## Configuration
 
 The plugin is configured via environment variables:

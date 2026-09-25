@@ -40,6 +40,8 @@ jest.mock('@mlflow/core', () => {
     },
     SpanAttributeKey: {
       TOKEN_USAGE: 'token_usage',
+      MODEL: 'mlflow.llm.model',
+      MODEL_PROVIDER: 'mlflow.llm.provider',
     },
   };
 });
@@ -421,6 +423,83 @@ describe('MLflowTracingPlugin', () => {
           }),
         }),
       );
+    });
+
+    it('should normalize Vertex provider IDs for MLflow pricing', async () => {
+      const messages = [
+        createUserMessage('Hello Vertex'),
+        createAssistantTextMessage('Hello!', {
+          modelID: 'gemini-3.8-flash',
+          providerID: 'google-vertex',
+        }),
+      ];
+
+      const mockClient = createMockClient({}, messages);
+      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
+
+      await hooks.event!(createSessionIdleEvent('vertex-pricing'));
+
+      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'llm_call',
+          attributes: expect.objectContaining({
+            'mlflow.llm.model': 'gemini-3.8-flash',
+            'mlflow.llm.provider': 'vertex_ai',
+          }),
+        }),
+      );
+    });
+
+    it('should preserve provider IDs that already match MLflow pricing', async () => {
+      const messages = [
+        createUserMessage('Hello OpenAI'),
+        createAssistantTextMessage('Hello!', {
+          modelID: 'gpt-5.6-terra',
+          providerID: 'openai',
+        }),
+      ];
+
+      const mockClient = createMockClient({}, messages);
+      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
+
+      await hooks.event!(createSessionIdleEvent('openai-pricing'));
+
+      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'llm_call',
+          attributes: expect.objectContaining({
+            'mlflow.llm.model': 'gpt-5.6-terra',
+            'mlflow.llm.provider': 'openai',
+          }),
+        }),
+      );
+    });
+
+    it('should use canonical MLflow cache token keys', async () => {
+      const messages = [
+        createUserMessage('Cache test'),
+        createAssistantTextMessage('Cached!', {
+          tokens: {
+            input: 100,
+            output: 20,
+            cache: { read: 80, write: 10 },
+          },
+        }),
+      ];
+
+      const mockClient = createMockClient({}, messages);
+      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
+
+      await hooks.event!(createSessionIdleEvent('cache-token-keys'));
+
+      const mockSpan = (mlflowTracing.startSpan as jest.Mock)();
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('token_usage', {
+        input_tokens: 100,
+        output_tokens: 20,
+        total_tokens: 120,
+        cache_read_input_tokens: 80,
+        cache_creation_input_tokens: 10,
+      });
     });
 
     it('should include reasoning content in LLM span outputs', async () => {
